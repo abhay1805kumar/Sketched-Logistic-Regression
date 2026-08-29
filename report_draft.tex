@@ -1,0 +1,625 @@
+\documentclass[12pt,a4paper]{report}
+
+\usepackage[margin=1in]{geometry}
+\usepackage{graphicx}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{booktabs}
+\usepackage{array}
+\usepackage{float}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{hyperref}
+\usepackage{xcolor}
+\usepackage{setspace}
+\usepackage{listings}
+
+\hypersetup{
+    colorlinks=true,
+    linkcolor=blue,
+    citecolor=blue,
+    urlcolor=blue
+}
+
+\onehalfspacing
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    frame=single,
+    columns=fullflexible
+}
+
+\newcommand{\figplaceholder}[1]{
+    \begin{center}
+    \fbox{
+        \begin{minipage}[c][2.1in][c]{0.86\textwidth}
+        \centering
+        #1\\
+        \vspace{0.1in}
+        \small Replace this box with the corresponding plot exported from \texttt{project\_analysis.ipynb}.
+        \end{minipage}
+    }
+    \end{center}
+}
+
+\begin{document}
+
+\pagenumbering{roman}
+
+\begin{titlepage}
+    \thispagestyle{plain}
+    \centering
+    \vspace*{1.0cm}
+    {\Large ME542: Numerical Analysis\par}
+    \vspace{1.2cm}
+    {\Huge\bfseries Matrix-Free and Sketched Newton Methods for Logistic Regression\par}
+    \vspace{0.8cm}
+    {\Large Term Project Technical Report\par}
+    \vfill
+    {\large April 2026\par}
+\end{titlepage}
+
+\chapter*{Abstract}
+\addcontentsline{toc}{chapter}{Abstract}
+
+Second-order optimization methods are attractive for machine learning because they use curvature information and often require far fewer outer iterations than first-order methods. However, the direct implementation of Newton's method becomes expensive for large-scale logistic regression because it requires Hessian construction and the solution of a dense linear system. This project studies numerical linear algebra techniques that make Newton-type optimization more practical for binary logistic regression. We compare Gradient Descent, exact Newton, Newton-CG, preconditioned Newton-CG, and a single-machine sketched Newton-CG method inspired by the Hessian sketching idea used in OverSketched Newton.
+
+The logistic regression objective is solved using stable numerical formulas, Hessian-vector products, diagonal preconditioning, backtracking line search, and Gaussian sketching. Experiments are performed on the UCI Spambase dataset and on synthetic datasets with controlled conditioning. The results show that Newton-type methods reach low training loss in far fewer outer iterations than Gradient Descent. On Spambase, exact Newton is very competitive in runtime because the dataset has only 57 features, making the Hessian only \(57\times57\). Therefore, Newton-CG and preconditioned CG are more clearly justified through scalability and conditioning experiments, where the feature dimension and Hessian condition number are varied. The study highlights the tradeoff between per-iteration cost, conditioning, inner linear-solver accuracy, and Hessian approximation quality.
+
+\tableofcontents
+\listoffigures
+\listoftables
+
+\chapter*{List of Symbols}
+\addcontentsline{toc}{chapter}{List of Symbols}
+
+\begin{table}[H]
+\centering
+\caption{List of symbols used in the report.}
+\label{tab:symbols}
+\begin{tabular}{>{\raggedright\arraybackslash}p{0.18\textwidth}p{0.72\textwidth}}
+\toprule
+Symbol & Meaning \\
+\midrule
+\(X\in\mathbb{R}^{n\times d}\) & Data matrix with \(n\) samples and \(d\) features. \\
+\(x_i\) & Feature vector of the \(i\)-th sample. \\
+\(y_i\in\{-1,1\}\) & Binary class label. \\
+\(w\in\mathbb{R}^d\) & Logistic regression weight vector. \\
+\(L(w)\) & Regularized logistic loss. \\
+\(\lambda\) & \(L_2\)-regularization parameter. \\
+\(g(w)\) & Gradient of the objective. \\
+\(H(w)\) & Hessian matrix of the objective. \\
+\(D\) & Diagonal matrix of logistic Hessian weights. \\
+\(p\) & Newton search direction. \\
+\(\alpha\) & Step length from line search. \\
+\(S\in\mathbb{R}^{m\times n}\) & Random sketching matrix. \\
+\(m\) & Sketch size, usually much smaller than \(n\). \\
+\(\tilde H\) & Sketched approximation of the Hessian. \\
+\(\kappa(H)\) & Condition number of Hessian \(H\). \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\clearpage
+\pagenumbering{arabic}
+
+\chapter{Introduction}
+
+Logistic regression is one of the standard convex optimization problems in binary classification. Although the model is simple, it provides a useful setting for studying numerical optimization because the objective is smooth, convex, and has a structured Hessian. This makes it suitable for comparing first-order and second-order numerical methods.
+
+Gradient Descent is inexpensive per iteration but may converge slowly, especially when the problem is ill-conditioned. Newton's method uses curvature information and often converges in far fewer iterations, but its direct implementation requires forming the Hessian and solving a dense linear system. For large datasets or high-dimensional feature spaces, these operations become computationally expensive.
+
+The objective of this project is to study how techniques from numerical linear algebra can make Newton-type methods more practical for logistic regression. In particular, we investigate:
+
+\begin{itemize}
+    \item Hessian-vector products instead of explicit Hessian inversion,
+    \item Conjugate Gradient for solving Newton systems,
+    \item diagonal preconditioning for improving inner linear solves,
+    \item Gaussian sketching for approximate Hessian systems,
+    \item conditioning and scalability effects using synthetic experiments.
+\end{itemize}
+
+The project is motivated by the Hessian sketching viewpoint used in OverSketched Newton \cite{oversketched}, but the present implementation is a single-machine numerical study and does not implement the distributed or serverless components of that work.
+
+\chapter{Problem Formulation}
+
+\section{Binary Logistic Regression}
+
+Let \(X\in\mathbb{R}^{n\times d}\) be the data matrix and let \(y_i\in\{-1,1\}\) be the class label for sample \(i\). We solve the regularized logistic regression problem
+\begin{equation}
+    \min_{w\in\mathbb{R}^d} L(w)
+    =
+    \frac{1}{n}\sum_{i=1}^{n}\log\left(1+\exp(-y_i x_i^T w)\right)
+    +
+    \frac{\lambda}{2}\|w\|_2^2.
+    \label{eq:loss}
+\end{equation}
+
+The regularization term improves numerical stability and makes the Hessian better conditioned. In the implementation, the default value is \(\lambda=10^{-4}\).
+
+\section{Gradient}
+
+Define
+\begin{equation}
+    z_i = y_i x_i^T w,
+    \qquad
+    \sigma(z)=\frac{1}{1+\exp(-z)}.
+\end{equation}
+The gradient of \eqref{eq:loss} is
+\begin{equation}
+    g(w)
+    =
+    -\frac{1}{n}X^T\left(y\odot(1-\sigma(y\odot Xw))\right)
+    +
+    \lambda w.
+    \label{eq:gradient}
+\end{equation}
+
+\section{Hessian}
+
+The Hessian has the structured form
+\begin{equation}
+    H(w)
+    =
+    \frac{1}{n}X^T D X+\lambda I,
+    \label{eq:hessian}
+\end{equation}
+where \(D\in\mathbb{R}^{n\times n}\) is diagonal with entries
+\begin{equation}
+    D_{ii}
+    =
+    \sigma(z_i)(1-\sigma(z_i)).
+\end{equation}
+
+This structure is important because it allows Hessian-vector products to be computed without explicitly forming \(H\):
+\begin{equation}
+    Hv
+    =
+    \frac{1}{n}X^T(D(Xv))+\lambda v.
+    \label{eq:hvp}
+\end{equation}
+
+\chapter{Numerical Methods}
+
+\section{Gradient Descent}
+
+Gradient Descent updates the parameter vector by
+\begin{equation}
+    w_{k+1}=w_k-\eta g(w_k),
+\end{equation}
+where \(\eta\) is a fixed learning rate. Its per-iteration cost is dominated by a gradient computation and is approximately \(O(nd)\). However, its convergence can be slow when the Hessian is ill-conditioned.
+
+\section{Exact Newton Method}
+
+Newton's method computes a search direction \(p_k\) by solving
+\begin{equation}
+    H(w_k)p_k=g(w_k),
+    \label{eq:newton_system}
+\end{equation}
+and then updates
+\begin{equation}
+    w_{k+1}=w_k-\alpha_k p_k.
+\end{equation}
+Here \(\alpha_k\) is selected using backtracking line search. The direct method forms \(H\) and solves \eqref{eq:newton_system} using dense linear algebra. The cost is approximately
+\begin{equation}
+    O(nd^2+d^3).
+\end{equation}
+
+\section{Backtracking Line Search}
+
+To improve robustness, Newton-type methods use a backtracking line search. Starting from \(\alpha=1\), the step length is reduced until
+\begin{equation}
+    L(w-\alpha p)
+    \le
+    L(w)-c\alpha g^T p,
+\end{equation}
+where \(c=10^{-4}\). On the Spambase dataset, the full Newton step is usually accepted, so the line-search and full-step curves overlap. This is a useful observation rather than an error.
+
+\section{Newton-CG}
+
+Newton-CG avoids explicitly solving the Newton system with a dense factorization. Instead, the system
+\[
+H p = g
+\]
+is solved iteratively using Conjugate Gradient. Each CG iteration only requires \(Hv\), which is computed using \eqref{eq:hvp}. This makes Newton-CG matrix-free and avoids explicit Hessian inversion.
+
+The approximate cost is
+\begin{equation}
+    O(knd),
+\end{equation}
+where \(k\) is the number of inner CG iterations.
+
+\section{Preconditioned Newton-CG}
+
+Preconditioning is used to improve the conditioning of the linear system solved by CG. A simple diagonal preconditioner is used:
+\begin{equation}
+    M^{-1}
+    \approx
+    \left(\operatorname{diag}(H)+\epsilon I\right)^{-1},
+\end{equation}
+where \(\epsilon=10^{-9}\) is added for numerical safety.
+
+Preconditioned CG solves an equivalent system with improved spectral properties. On small datasets, the overhead of preconditioning may hide its benefit. On more ill-conditioned synthetic problems, preconditioning is expected to reduce the number of inner CG iterations.
+
+\chapter{Sketched Newton-CG}
+
+\section{Hessian Sketching}
+
+The Hessian can be written as
+\begin{equation}
+    H = \frac{1}{n}X^T D X+\lambda I.
+\end{equation}
+Let
+\begin{equation}
+    A = D^{1/2}X.
+\end{equation}
+Then
+\begin{equation}
+    H = \frac{1}{n}A^T A+\lambda I.
+\end{equation}
+
+Using a Gaussian sketch matrix \(S\in\mathbb{R}^{m\times n}\), where \(m<n\), the sketched Hessian is
+\begin{equation}
+    \tilde H
+    =
+    \frac{1}{n}A^T S^TSA+\lambda I.
+    \label{eq:sketched_hessian}
+\end{equation}
+
+The corresponding sketched Hessian-vector product is
+\begin{equation}
+    \tilde H v
+    =
+    \frac{1}{n}
+    X^T
+    \left(
+    \sqrt{D}\,S^T S(\sqrt{D}(Xv))
+    \right)
+    +
+    \lambda v.
+    \label{eq:sketched_hvp}
+\end{equation}
+
+\section{Sketch Size Tradeoff}
+
+The sketch size \(m\) controls the tradeoff between cost and accuracy. A small sketch is cheaper but may give a poor Newton direction. A larger sketch better approximates the Hessian but increases computational cost. The experiments compare sketch sizes such as \(m=d\), \(m=2d\), and \(m=5d\).
+
+\chapter{Implementation Details}
+
+\section{Code Organization}
+
+The implementation is split into two main Python files:
+
+\begin{itemize}
+    \item \texttt{code.py}: shared logistic regression routines, stable loss and gradient, Hessian-vector products, Hessian diagonal, Gradient Descent, and Spambase loading.
+    \item \texttt{Z\_project.py}: exact Newton, Newton-CG, preconditioned Newton-CG, sketched Newton-CG, line search, and comparison runner.
+\end{itemize}
+
+The analysis and plots are produced in \texttt{project\_analysis.ipynb}.
+
+\section{Numerical Stability}
+
+Several numerical safeguards are used:
+
+\begin{itemize}
+    \item sigmoid arguments are clipped to avoid overflow,
+    \item \(\log(1+\exp(\cdot))\) is evaluated using a stable log-sum-exp form,
+    \item features are standardized,
+    \item a small regularization parameter \(\lambda=10^{-4}\) is used,
+    \item divisions in preconditioning and CG are protected by \(\epsilon=10^{-9}\).
+\end{itemize}
+
+\section{Dataset Preprocessing}
+
+The Spambase data file is loaded using comma separation. The last column is the label. Labels are converted from \(\{0,1\}\) to \(\{-1,1\}\), and all feature columns are standardized. Zero-variance columns, if any, are protected by replacing their standard deviation by one.
+
+\chapter{Experimental Setup}
+
+\section{Datasets}
+
+Two types of datasets are used:
+
+\begin{enumerate}
+    \item \textbf{Spambase dataset}: real binary classification data from the UCI Machine Learning Repository \cite{spambase}.
+    \item \textbf{Synthetic datasets}: generated with controlled feature dimension and conditioning to study scalability and preconditioning.
+\end{enumerate}
+
+Table \ref{tab:data_summary} summarizes the main dataset properties.
+
+\begin{table}[H]
+\centering
+\caption{Dataset summary.}
+\label{tab:data_summary}
+\begin{tabular}{lccc}
+\toprule
+Dataset & Samples \(n\) & Features \(d\) & Labels \\
+\midrule
+Spambase & 4601 & 57 & Binary \(\{-1,1\}\) \\
+Synthetic conditioning data & variable & 40 & Binary \(\{-1,1\}\) \\
+Synthetic scalability data & 500 & 50--300 & Binary \(\{-1,1\}\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Methods Compared}
+
+The methods compared are summarized in Table \ref{tab:method_summary}.
+
+\begin{table}[H]
+\centering
+\caption{Optimization methods compared in the project.}
+\label{tab:method_summary}
+\begin{tabular}{lll}
+\toprule
+Method & Linear algebra idea & Main cost characteristic \\
+\midrule
+Gradient Descent & First-order update & \(O(nd)\) per iteration \\
+Exact Newton & Dense Hessian solve & \(O(nd^2+d^3)\) \\
+Newton-CG & Hessian-vector products & \(O(knd)\) \\
+Newton-PCG & Preconditioned CG & fewer effective CG iterations \\
+Sketched Newton-CG & Randomized Hessian approximation & depends on sketch size \(m\) \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Evaluation Metrics}
+
+The following metrics are used:
+
+\begin{itemize}
+    \item training loss versus outer iterations,
+    \item training loss versus runtime,
+    \item final training accuracy,
+    \item number of inner CG iterations,
+    \item Hessian condition number,
+    \item CG residual decay,
+    \item sketched Newton direction quality.
+\end{itemize}
+
+\chapter{Results and Discussion}
+
+\section{Spambase: Loss versus Iteration}
+
+Figure \ref{fig:loss_iter} should be generated from the notebook section ``Loss plots''. The expected result is that Gradient Descent decreases the loss gradually, while Newton-type methods reach the low-loss region in far fewer outer iterations.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Spambase training loss versus iteration}
+\caption{Training loss versus iteration for Gradient Descent, exact Newton, Newton-CG, and Newton-PCG on Spambase.}
+\label{fig:loss_iter}
+\end{figure}
+
+\section{Spambase: Loss versus Runtime}
+
+Figure \ref{fig:loss_time} compares loss against wall-clock time. On Spambase, exact Newton may be faster than Newton-CG and PCG because \(d=57\), so the dense Hessian solve is cheap.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Spambase training loss versus runtime}
+\caption{Training loss versus runtime on Spambase. Exact Newton is competitive because the feature dimension is small.}
+\label{fig:loss_time}
+\end{figure}
+
+\section{Newton Family Comparison}
+
+The Newton, Newton-CG, and Newton-PCG loss curves are expected to nearly overlap on Spambase. This means the CG-based methods compute directions close to the exact Newton direction.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Zoomed comparison of exact Newton, Newton-CG, and Newton-PCG}
+\caption{Newton-family loss curves on Spambase. Overlap indicates that CG-based methods accurately approximate the exact Newton step.}
+\label{fig:newton_family}
+\end{figure}
+
+\section{Final Method Summary}
+
+Table \ref{tab:spambase_results} is a report-ready table. Fill the numerical entries from the notebook output after running all cells.
+
+\begin{table}[H]
+\centering
+\caption{Final method comparison on Spambase. Replace the placeholders with values printed by the notebook.}
+\label{tab:spambase_results}
+\begin{tabular}{lcccc}
+\toprule
+Method & Final loss & Runtime (s) & Accuracy & Avg. inner iterations \\
+\midrule
+Gradient Descent & -- & -- & -- & -- \\
+Exact Newton & -- & -- & -- & -- \\
+Newton-CG & -- & -- & -- & -- \\
+Newton-PCG & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Line Search Effect}
+
+The line-search and full-step Newton curves may overlap on Spambase. This happens because the full Newton step is already stable for this dataset. Therefore, line search acts mainly as a robustness mechanism.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Newton with line search versus full Newton step}
+\caption{Effect of line search on Spambase. The curves may overlap because the full Newton step is accepted.}
+\label{fig:line_search}
+\end{figure}
+
+\section{Sketch Size Tradeoff}
+
+Figure \ref{fig:sketch_tradeoff} compares sketched Newton for different sketch sizes. Smaller sketches are cheaper but less accurate; larger sketches better approximate exact Newton behavior.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Sketch size tradeoff for sketched Newton-CG}
+\caption{Sketch size tradeoff. Larger sketch size generally improves Hessian approximation quality.}
+\label{fig:sketch_tradeoff}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Sketch size summary. Replace entries using the notebook output.}
+\label{tab:sketch_summary}
+\begin{tabular}{cccc}
+\toprule
+Sketch size \(m\) & Final loss & Runtime (s) & Avg. CG iterations \\
+\midrule
+\(d\) & -- & -- & -- \\
+\(2d\) & -- & -- & -- \\
+\(5d\) & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Sketched Direction Quality}
+
+To directly evaluate the quality of the sketched Newton direction, we compare the exact Newton direction \(p\) and sketched direction \(\tilde p\) using
+\begin{equation}
+    \frac{\|p-\tilde p\|_2}{\|p\|_2}
+\end{equation}
+and cosine similarity
+\begin{equation}
+    \frac{p^T\tilde p}{\|p\|_2\|\tilde p\|_2}.
+\end{equation}
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Relative step error, cosine similarity, and one-step loss for sketched Newton directions}
+\caption{Quality of sketched Newton directions as sketch size changes.}
+\label{fig:step_quality}
+\end{figure}
+
+\section{Conditioning Study}
+
+Synthetic datasets are used to study the effect of conditioning. As the condition number increases, Gradient Descent tends to slow down and CG may require more inner iterations. Newton-type methods are less sensitive in terms of outer iterations, but the linear solve becomes more challenging.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Synthetic conditioning study comparing GD, Newton, Newton-CG, and Newton-PCG}
+\caption{Effect of conditioning on convergence behavior using synthetic datasets.}
+\label{fig:conditioning}
+\end{figure}
+
+\section{Preconditioning Effect}
+
+Preconditioning is evaluated through the number of inner CG iterations. It is not always visually dramatic on Spambase, but it is more meaningful on synthetic ill-conditioned datasets.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Average inner iterations for CG and PCG under different conditioning levels}
+\caption{Preconditioning effect measured through average inner CG iterations.}
+\label{fig:preconditioning}
+\end{figure}
+
+\section{Scalability Study}
+
+The scalability experiment varies the feature dimension \(d\). This experiment is important because Spambase is too small in feature dimension to show the runtime advantage of Newton-CG and PCG clearly. The expected pattern is that exact Newton becomes more expensive as \(d\) grows, while CG-based methods scale more favorably.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Runtime scalability and inner-iteration scalability as feature dimension grows}
+\caption{Scalability comparison of exact Newton, Newton-CG, and Newton-PCG on synthetic data.}
+\label{fig:scalability}
+\end{figure}
+
+\begin{table}[H]
+\centering
+\caption{Scalability summary. Replace entries using the notebook output.}
+\label{tab:scalability}
+\begin{tabular}{cccccc}
+\toprule
+\(d\) & Newton time & CG time & PCG time & CG iters & PCG iters \\
+\midrule
+50 & -- & -- & -- & -- & -- \\
+100 & -- & -- & -- & -- & -- \\
+150 & -- & -- & -- & -- & -- \\
+200 & -- & -- & -- & -- & -- \\
+250 & -- & -- & -- & -- & -- \\
+300 & -- & -- & -- & -- & -- \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{Hessian Spectrum}
+
+The Hessian eigenvalue spectrum gives direct evidence of conditioning. This is especially important for a numerical analysis project because it connects the observed convergence behavior to spectral properties of the optimization problem.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Hessian eigenvalue spectrum for Spambase and synthetic datasets}
+\caption{Hessian eigenvalue spectrum and conditioning comparison.}
+\label{fig:hessian_spectrum}
+\end{figure}
+
+\section{CG Residual Decay}
+
+The residual decay plot compares the inner linear solver behavior of CG and PCG. While loss curves describe outer optimization progress, residual curves show the numerical behavior of the linear system solve.
+
+\begin{figure}[H]
+\centering
+\figplaceholder{Relative residual decay for CG and PCG}
+\caption{CG and PCG residual decay on a synthetic problem.}
+\label{fig:residual_decay}
+\end{figure}
+
+\chapter{Summary and Conclusion}
+
+This project studied second-order optimization methods for logistic regression from a numerical linear algebra perspective. The main conclusion is that Newton-type methods can reach lower training loss in fewer outer iterations than Gradient Descent. Exact Newton performs very well on Spambase because the feature dimension is small, but this does not contradict the motivation for Newton-CG. Instead, it shows that the best method depends on problem scale.
+
+Newton-CG avoids explicit Hessian inversion and uses Hessian-vector products, making it more suitable for large feature dimensions. Preconditioned Newton-CG adds a diagonal approximation to improve the inner CG solve. The benefit of preconditioning is most visible in synthetic experiments where conditioning is controlled. Sketched Newton-CG introduces a randomized approximation of the Hessian. The sketch size controls a clear tradeoff between computational cost and step quality.
+
+From a numerical analysis viewpoint, the most important observations are:
+
+\begin{itemize}
+    \item conditioning strongly affects Gradient Descent and CG behavior,
+    \item Hessian-vector products allow matrix-free second-order optimization,
+    \item exact Newton may be best for small \(d\), but scales poorly with large \(d\),
+    \item preconditioning improves the numerical behavior of iterative linear solves,
+    \item sketching provides a useful approximation but must be large enough to preserve curvature information.
+\end{itemize}
+
+Overall, the project demonstrates how numerical linear algebra tools can make second-order optimization methods more practical and interpretable for machine learning problems.
+
+\appendix
+
+\chapter{Computer Code Summary}
+
+The main project code is organized as follows:
+
+\begin{itemize}
+    \item \texttt{code.py}: logistic loss, gradient, Hessian-vector product, Hessian diagonal, Gradient Descent, and data loading.
+    \item \texttt{Z\_project.py}: exact Newton, Newton-CG, preconditioned Newton-CG, sketched Newton-CG, and line search.
+    \item \texttt{project\_analysis.ipynb}: experiments, plots, and report-ready tables.
+\end{itemize}
+
+The full source code can be included as a separate printout or appendix if required by the project guidelines.
+
+\begin{thebibliography}{9}
+
+\bibitem{oversketched}
+S. Wang, F. Roosta, P. Xu, and M. W. Mahoney,
+\textit{OverSketched Newton: Fast Convex Optimization for Serverless Systems},
+arXiv preprint arXiv:1903.08857, 2019.
+Available: \url{https://arxiv.org/abs/1903.08857}
+
+\bibitem{spambase}
+M. Hopkins, E. Reeber, G. Forman, and J. Suermondt,
+\textit{Spambase Data Set},
+UCI Machine Learning Repository.
+Available: \url{https://archive.ics.uci.edu/dataset/94/spambase}
+
+\bibitem{nocedal}
+J. Nocedal and S. J. Wright,
+\textit{Numerical Optimization},
+2nd ed., Springer, 2006.
+
+\bibitem{golub}
+G. H. Golub and C. F. Van Loan,
+\textit{Matrix Computations},
+4th ed., Johns Hopkins University Press, 2013.
+
+\bibitem{halko}
+N. Halko, P. G. Martinsson, and J. A. Tropp,
+``Finding structure with randomness: Probabilistic algorithms for constructing approximate matrix decompositions,''
+\textit{SIAM Review}, vol. 53, no. 2, pp. 217--288, 2011.
+
+\end{thebibliography}
+
+\end{document}
