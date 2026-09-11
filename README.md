@@ -84,7 +84,7 @@ The project demonstrates how **Newton-CG, preconditioning, and sketching** can r
 
 
 
-## 13. Final Takeaway
+## Final Takeaway
 
 The project is currently in a good state:
 
